@@ -1,23 +1,43 @@
 import os
-import logging
+import glob
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Normal
+from torch.distributions import Normal, Independent
+from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-
-os.environ["NUMBA_DISABLE_INTEL_SVML"] = "1"
-logging.getLogger("numba").setLevel(logging.WARNING)
 
 from drone_crowd_env import DroneCrowdEnv
 
-ENABLE_GUI = True
-GUI_INTERVAL = 1
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+ENABLE_GUI = False          # True = watch every GUI_INTERVAL-th update live (slower)
+GUI_INTERVAL = 25
+WARM_START_EPOCHS = 0       # behavioural-cloning warm start; 0 = disabled (recommended)
+
+NUM_UPDATES = 400           # PPO updates
+EPISODES_PER_UPDATE = 3     # episodes collected per update (=> 1200 episodes total)
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+PPO_EPOCHS = 4
+MINI_BATCH_SIZE = 256
+CLIP_EPS = 0.2
+ENTROPY_COEF = 0.01
+MAX_GRAD_NORM = 0.5
+TARGET_KL = 0.03
+INIT_LR = 3e-4
+FINAL_LR_FRAC = 0.1         # lr decays linearly to INIT_LR * FINAL_LR_FRAC
+BEST_MA_WINDOW = 5          # best_actor.pth is chosen by the moving average of this many updates
 
 
+# ----------------------------------------------------------------------------
+# Networks (GaussianActor is imported by validate_mappo.py - keep the class name)
+# ----------------------------------------------------------------------------
 class GaussianActor(nn.Module):
-    def __init__(self, obs_dim, act_dim):
+    def __init__(self, obs_dim, act_dim, init_log_std=-1.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, 128),
@@ -28,14 +48,27 @@ class GaussianActor(nn.Module):
             nn.Tanh(),
         )
         self.mean_layer = nn.Linear(128, act_dim)
-        self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
+        self.log_std = nn.Parameter(torch.full((act_dim,), float(init_log_std)))
 
     def forward(self, obs):
+        is_1d = (obs.dim() == 1)
+        if is_1d:
+            obs = obs.unsqueeze(0)
+
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=-1.0)
+
         x = self.net(obs)
         mean = torch.tanh(self.mean_layer(x))
         bounded_log_std = torch.clamp(self.log_std, min=-2.0, max=0.5)
         std = torch.exp(bounded_log_std).expand_as(mean)
-        return Normal(mean, std)
+        std = torch.clamp(std, min=1e-3, max=10.0)
+
+        if is_1d:
+            mean = mean.squeeze(0)
+            std = std.squeeze(0)
+
+        base_dist = Normal(mean, std)
+        return Independent(base_dist, reinterpreted_batch_ndims=1)
 
 
 class CentralizedCritic(nn.Module):
@@ -52,59 +85,208 @@ class CentralizedCritic(nn.Module):
         )
 
     def forward(self, global_state):
+        if global_state.dim() == 1:
+            global_state = global_state.unsqueeze(0)
         return self.net(global_state)
 
 
-def plot_training_results(episodes, rewards, actor_losses, critic_losses):
-    plt.style.use('seaborn-v0_8-darkgrid' if 'seaborn-v0_8-darkgrid' in plt.style.available else 'default')
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
-    fig.suptitle("MAPPO Drone Swarm Training Performance", fontsize=14, fontweight='bold')
+# ----------------------------------------------------------------------------
+# Optional behavioural-cloning warm start (disabled by default)
+# ----------------------------------------------------------------------------
+class CrowdImitationDataset(Dataset):
+    def __init__(self, dataset_dir="dataset", obs_dim=55):
+        self.samples = []
+        for file_path in glob.glob(os.path.join(dataset_dir, "*.npz")):
+            data = np.load(file_path)
+            h_pos = data["human_positions"]
+            surge = data["surge_active"]
 
-    ax1.plot(episodes, rewards, alpha=0.3, color='dodgerblue', label='Episode Reward')
-    if len(rewards) >= 10:
-        ma_rewards = np.convolve(rewards, np.ones(10)/10, mode='valid')
-        ax1.plot(episodes[9:], ma_rewards, color='blue', linewidth=2, label='10-Ep Moving Avg')
-    ax1.set_ylabel("Total Swarm Reward", fontsize=11)
-    ax1.legend(loc='upper left')
-    ax1.set_title("Reward Convergence", fontsize=12)
+            for t in range(len(surge)):
+                if not surge[t]:
+                    expert_act = np.array([0.0, 0.0, 0.5, 0.0], dtype=np.float32)
+                else:
+                    expert_act = np.array([0.0, -0.3, -1.0, 0.0], dtype=np.float32)
 
-    color_actor = 'crimson'
-    ax2.set_xlabel("Episode", fontsize=11)
-    ax2.set_ylabel("Actor Loss", color=color_actor, fontsize=11)
-    line1 = ax2.plot(episodes, actor_losses, color=color_actor, label='Actor Loss', alpha=0.8)
-    ax2.tick_params(axis='y', labelcolor=color_actor)
+                dummy_obs = np.zeros(obs_dim, dtype=np.float32)
+                dummy_obs[0:2] = np.mean(h_pos[t], axis=0)
+                self.samples.append((dummy_obs, expert_act))
 
-    ax2_twin = ax2.twinx()
-    color_critic = 'darkorange'
-    ax2_twin.set_ylabel("Critic Loss", color=color_critic, fontsize=11)
-    line2 = ax2_twin.plot(episodes, critic_losses, color=color_critic, label='Critic Loss', alpha=0.8)
-    ax2_twin.tick_params(axis='y', labelcolor=color_critic)
+    def __len__(self):
+        return len(self.samples)
 
-    lines = line1 + line2
-    labels = [l.get_label() for l in lines]
-    ax2.legend(lines, labels, loc='upper right')
-    ax2.set_title("Policy & Value Network Losses (Dual Scale)", fontsize=12)
+    def __getitem__(self, idx):
+        return (torch.tensor(self.samples[idx][0], dtype=torch.float32),
+                torch.tensor(self.samples[idx][1], dtype=torch.float32))
+
+
+def warm_start_actor(actor, obs_dim, dataset_dir="dataset", epochs=2, lr=1e-4):
+    print("\n=== Pre-training Actor via Behavioral Cloning (Warm-Start) ===")
+    dataset = CrowdImitationDataset(dataset_dir=dataset_dir, obs_dim=obs_dim)
+    if len(dataset) == 0:
+        print("[Warning] No dataset found. Skipping warm-start.")
+        return
+
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    optimizer = optim.Adam(actor.parameters(), lr=lr)
+
+    actor.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for states, expert_acts in loader:
+            dist = actor(states)
+            loss = F.mse_loss(dist.mean, expert_acts)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"BC Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(loader):.4f}")
+    print("=== Warm-Start Complete ===\n")
+
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+class RunningStd:
+    """Running std of discounted returns -> used to scale rewards so the critic sees O(1) targets."""
+
+    def __init__(self):
+        self.mean, self.var, self.count = 0.0, 1.0, 1e-4
+
+    def update(self, x):
+        x = np.asarray(x, dtype=np.float64)
+        bm, bv, bc = x.mean(), x.var(), x.size
+        delta = bm - self.mean
+        tot = self.count + bc
+        self.mean += delta * bc / tot
+        self.var = (self.var * self.count + bv * bc + delta ** 2 * self.count * bc / tot) / tot
+        self.count = tot
+
+    @property
+    def std(self):
+        return float(np.sqrt(self.var) + 1e-8)
+
+
+def discounted_returns(rewards, gamma):
+    out = np.zeros(len(rewards), dtype=np.float64)
+    g = 0.0
+    for t in reversed(range(len(rewards))):
+        g = rewards[t] + gamma * g
+        out[t] = g
+    return out
+
+
+def compute_gae(rewards, values, last_value, gamma, lam):
+    T = len(rewards)
+    v = np.append(np.asarray(values, dtype=np.float32), np.float32(last_value))
+    adv = np.zeros(T, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+        delta = rewards[t] + gamma * v[t + 1] - v[t]
+        gae = delta + gamma * lam * gae
+        adv[t] = gae
+    return adv, adv + v[:-1]
+
+
+def collect_episode(env, actor, critic, render=False):
+    env.render_mode = "human" if render else None
+    obs, _ = env.reset()
+    traj = {a: {"obs": [], "act": [], "logprob": [], "reward": [], "val": [], "state": []}
+            for a in env.possible_agents}
+    metrics = {"ped": [], "area": [], "ov": []}
+
+    while env.agents:
+        global_state = env.get_global_state()
+        with torch.no_grad():
+            value = critic(torch.tensor(global_state, dtype=torch.float32)).item()
+
+        actions, step_obs, step_acts, step_logprobs = {}, {}, {}, {}
+        for agent in env.agents:
+            agent_obs = obs[agent]
+            with torch.no_grad():
+                dist = actor(torch.tensor(agent_obs, dtype=torch.float32))
+                action = dist.sample()
+                log_prob = dist.log_prob(action)
+            action_np = torch.clamp(action, -1.0, 1.0).cpu().numpy()
+            actions[agent] = action_np
+            step_obs[agent] = agent_obs
+            step_acts[agent] = action_np
+            step_logprobs[agent] = log_prob.item()
+
+        obs, rewards, _, _, infos = env.step(actions)
+
+        for agent in step_obs:
+            traj[agent]["obs"].append(step_obs[agent])
+            traj[agent]["state"].append(global_state)
+            traj[agent]["act"].append(step_acts[agent])
+            traj[agent]["logprob"].append(step_logprobs[agent])
+            traj[agent]["reward"].append(rewards[agent])
+            traj[agent]["val"].append(value)
+
+        if infos:
+            m = next(iter(infos.values()))
+            metrics["ped"].append(m["ped_coverage"])
+            metrics["area"].append(m["area_coverage"])
+            metrics["ov"].append(m["overlap_of_union"])
+
+    # The episode ends on a time limit, so bootstrap from the critic instead of assuming V=0.
+    with torch.no_grad():
+        last_value = critic(torch.tensor(env.get_global_state(), dtype=torch.float32)).item()
+
+    return traj, last_value, {k: float(np.mean(v)) for k, v in metrics.items()}
+
+
+def plot_training_results(h):
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
+    fig.suptitle("MAPPO Drone Swarm Training Performance", fontsize=14, fontweight="bold")
+    x = h["update"]
+
+    ax1.plot(x, h["reward"], alpha=0.3, color="dodgerblue", label="Mean episode reward (per update)")
+    if len(h["reward"]) >= 10:
+        ma = np.convolve(h["reward"], np.ones(10) / 10, mode="valid")
+        ax1.plot(x[9:], ma, color="blue", linewidth=2, label="10-update moving avg")
+    ax1.set_ylabel("Total Swarm Reward")
+    ax1.set_title("Reward Convergence")
+    ax1.legend(loc="upper left")
+
+    ax2.plot(x, np.array(h["ped"]) * 100, label="Pedestrian coverage %", color="green")
+    ax2.plot(x, np.array(h["area"]) * 100, label="Area coverage %", color="teal")
+    ax2.plot(x, np.array(h["ov"]) * 100, label="Overlap % (of covered area)", color="crimson")
+    ax2.set_ylabel("%")
+    ax2.set_title("Coverage vs Overlap")
+    ax2.legend(loc="best")
+
+    ax3.set_xlabel("PPO update")
+    ax3.set_ylabel("Actor Loss", color="crimson")
+    ax3.plot(x, h["actor_loss"], color="crimson", alpha=0.8)
+    ax3t = ax3.twinx()
+    ax3t.set_ylabel("Critic Loss", color="darkorange")
+    ax3t.plot(x, h["critic_loss"], color="darkorange", alpha=0.8)
 
     plt.tight_layout()
+    os.makedirs("checkpoints", exist_ok=True)
     plt.savefig("checkpoints/training_performance.png", dpi=300)
-    print("\n[Graphics] Saved training plot to './checkpoints/training_performance.png'")
     plt.show()
 
 
-def train():
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+def train(num_updates=NUM_UPDATES, episodes_per_update=EPISODES_PER_UPDATE,
+          dataset_dir="dataset", seed=0):
     os.makedirs("checkpoints", exist_ok=True)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     env = DroneCrowdEnv(
         num_drones=3,
-        num_people=30,
-        env_size=(40, 40),
-        fov_size=(8.0, 5.0),
+        env_size=(25, 25),
+        base_fov_size=(8.0, 4.5),
         k_nearest=5,
-        max_steps=300,
-        render_mode=None
+        dataset_dir=dataset_dir,
+        render_mode=None,
     )
 
-    obs, _ = env.reset()
+    env.reset()
     obs_dim = env.observation_space("drone_0").shape[0]
     act_dim = env.action_space("drone_0").shape[0]
     global_state_dim = len(env.get_global_state())
@@ -112,199 +294,128 @@ def train():
     actor = GaussianActor(obs_dim, act_dim)
     critic = CentralizedCritic(global_state_dim)
 
-    init_lr = 3e-4
-    actor_opt = optim.Adam(actor.parameters(), lr=init_lr)
-    critic_opt = optim.Adam(critic.parameters(), lr=init_lr)
+    if WARM_START_EPOCHS > 0:
+        warm_start_actor(actor, obs_dim, dataset_dir=dataset_dir, epochs=WARM_START_EPOCHS)
 
-    num_episodes = 500
-    gamma = 0.99
-    gae_lambda = 0.95
-    ppo_epochs = 4
-    mini_batch_size = 128
-    clip_eps = 0.2
-    entropy_coef = 0.01
-    reward_scale = 0.05
-    max_grad_norm = 0.5
-    target_kl = 0.05
-    best_reward = -float("inf")
+    actor_opt = optim.Adam(actor.parameters(), lr=INIT_LR)
+    critic_opt = optim.Adam(critic.parameters(), lr=INIT_LR)
 
-    history_episodes, history_rewards = [], []
-    history_actor_loss, history_critic_loss = [], []
+    ret_rms = RunningStd()
+    best_ma = -float("inf")
+    hist = {k: [] for k in ["update", "reward", "ped", "area", "ov", "actor_loss", "critic_loss"]}
 
-    print("=== Starting Restored MAPPO Training ===")
-    print(f"Observation Dim: {obs_dim} | Global State Dim: {global_state_dim}\n")
+    print("=== Starting MAPPO Training ===")
+    print(f"Observation Dim: {obs_dim} | Global State Dim: {global_state_dim} | "
+          f"{num_updates} updates x {episodes_per_update} episodes\n")
 
-    for episode in range(num_episodes):
-        frac = max(0.1, 1.0 - (episode / float(num_episodes)))
-        curr_lr = init_lr * frac
-        for param_group in actor_opt.param_groups:
-            param_group['lr'] = curr_lr
-        for param_group in critic_opt.param_groups:
-            param_group['lr'] = curr_lr
+    for update in range(num_updates):
+        frac = update / max(num_updates - 1, 1)
+        lr = INIT_LR * (1.0 - frac * (1.0 - FINAL_LR_FRAC))
+        for opt in (actor_opt, critic_opt):
+            for g in opt.param_groups:
+                g["lr"] = lr
 
-        should_render = ENABLE_GUI and ((episode + 1) % GUI_INTERVAL == 0)
-        env.render_mode = "human" if should_render else None
-
-        obs, _ = env.reset()
-
-        agent_trajectories = {
-            agent: {"obs": [], "act": [], "logprob": [], "reward": [], "val": [], "state": []}
-            for agent in env.possible_agents
-        }
-        raw_ep_rewards = {agent: 0.0 for agent in env.possible_agents}
-
-        while env.agents:
-            global_state = env.get_global_state()
-            state_tensor = torch.tensor(global_state, dtype=torch.float32)
-
-            with torch.no_grad():
-                value = critic(state_tensor).item()
-
-            actions = {}
-            step_obs, step_acts, step_logprobs = {}, {}, {}
-
-            for agent in env.agents:
-                agent_obs = obs[agent]
-                obs_tensor = torch.tensor(agent_obs, dtype=torch.float32)
-
-                with torch.no_grad():
-                    dist = actor(obs_tensor)
-                    action = dist.sample()
-                    log_prob = dist.log_prob(action).sum()
-
-                action_np = torch.clamp(action, -1.0, 1.0).numpy()
-                actions[agent] = action_np
-
-                step_obs[agent] = agent_obs
-                step_acts[agent] = action_np
-                step_logprobs[agent] = log_prob.item()
-
-            next_obs, rewards, terminations, truncations, _ = env.step(actions)
-
-            for agent in step_obs:
-                agent_trajectories[agent]["obs"].append(step_obs[agent])
-                agent_trajectories[agent]["state"].append(global_state)
-                agent_trajectories[agent]["act"].append(step_acts[agent])
-                agent_trajectories[agent]["logprob"].append(step_logprobs[agent])
-                agent_trajectories[agent]["reward"].append(rewards[agent] * reward_scale)
-                agent_trajectories[agent]["val"].append(value)
-                raw_ep_rewards[agent] += rewards[agent]
-
-            obs = next_obs
+        reward_scale = 1.0 / ret_rms.std   # frozen for the whole update
+        render = ENABLE_GUI and ((update + 1) % GUI_INTERVAL == 0)
 
         all_obs, all_states, all_acts, all_logprobs = [], [], [], []
         all_returns, all_advantages = [], []
+        ep_rewards, ep_ped, ep_area, ep_ov = [], [], [], []
+        raw_discounted = []
 
-        for agent in env.possible_agents:
-            traj = agent_trajectories[agent]
-            r = traj["reward"]
-            v = traj["val"] + [0.0]
-            T = len(r)
+        for ep in range(episodes_per_update):
+            traj, last_value, m = collect_episode(env, actor, critic, render=(render and ep == 0))
+            ep_total = 0.0
+            for agent in env.possible_agents:
+                t = traj[agent]
+                raw_r = np.array(t["reward"], dtype=np.float64)
+                ep_total += raw_r.sum()
+                raw_discounted.append(discounted_returns(raw_r, GAMMA))
 
-            adv = np.zeros(T, dtype=np.float32)
-            gae = 0.0
-            for t in reversed(range(T)):
-                delta = r[t] + gamma * v[t + 1] - v[t]
-                gae = delta + gamma * gae_lambda * gae
-                adv[t] = gae
+                adv, ret = compute_gae((raw_r * reward_scale).astype(np.float32),
+                                       t["val"], last_value, GAMMA, GAE_LAMBDA)
+                all_obs.extend(t["obs"])
+                all_states.extend(t["state"])
+                all_acts.extend(t["act"])
+                all_logprobs.extend(t["logprob"])
+                all_advantages.extend(adv)
+                all_returns.extend(ret)
 
-            ret = adv + np.array(traj["val"], dtype=np.float32)
+            ep_rewards.append(ep_total)
+            ep_ped.append(m["ped"]); ep_area.append(m["area"]); ep_ov.append(m["ov"])
 
-            all_obs.extend(traj["obs"])
-            all_states.extend(traj["state"])
-            all_acts.extend(traj["act"])
-            all_logprobs.extend(traj["logprob"])
-            all_advantages.extend(adv)
-            all_returns.extend(ret)
+        ret_rms.update(np.concatenate(raw_discounted))   # used from the NEXT update on
 
         obs_t = torch.tensor(np.array(all_obs), dtype=torch.float32)
         state_t = torch.tensor(np.array(all_states), dtype=torch.float32)
         act_t = torch.tensor(np.array(all_acts), dtype=torch.float32)
         old_logprob_t = torch.tensor(np.array(all_logprobs), dtype=torch.float32)
         returns_t = torch.tensor(np.array(all_returns), dtype=torch.float32)
-
         adv_np = np.array(all_advantages, dtype=np.float32)
         adv_t = torch.tensor((adv_np - adv_np.mean()) / (adv_np.std() + 1e-8), dtype=torch.float32)
 
-        epoch_actor_losses, epoch_critic_losses = [], []
-        dataset_size = obs_t.size(0)
+        actor_losses, critic_losses = [], []
+        n = obs_t.size(0)
 
-        for epoch in range(ppo_epochs):
-            permutation = torch.randperm(dataset_size)
-            epoch_kls = []
+        for _ in range(PPO_EPOCHS):
+            perm = torch.randperm(n)
+            kls = []
+            for s in range(0, n, MINI_BATCH_SIZE):
+                idx = perm[s:s + MINI_BATCH_SIZE]
 
-            for start_idx in range(0, dataset_size, mini_batch_size):
-                batch_indices = permutation[start_idx : start_idx + mini_batch_size]
-
-                b_obs = obs_t[batch_indices]
-                b_state = state_t[batch_indices]
-                b_act = act_t[batch_indices]
-                b_old_logprob = old_logprob_t[batch_indices]
-                b_adv = adv_t[batch_indices]
-                b_returns = returns_t[batch_indices]
-
-                dist = actor(b_obs)
-                new_logprob = dist.log_prob(b_act).sum(dim=-1)
-                entropy = dist.entropy().sum(dim=-1).mean()
-                log_ratio = new_logprob - b_old_logprob
+                dist = actor(obs_t[idx])
+                new_logprob = dist.log_prob(act_t[idx])
+                entropy = dist.entropy().mean()
+                log_ratio = new_logprob - old_logprob_t[idx]
                 ratios = torch.exp(log_ratio)
-
                 with torch.no_grad():
-                    approx_kl = (b_old_logprob - new_logprob).mean().item()
-                    epoch_kls.append(approx_kl)
+                    kls.append(((ratios - 1) - log_ratio).mean().item())
 
-                surr1 = ratios * b_adv
-                surr2 = torch.clamp(ratios, 1.0 - clip_eps, 1.0 + clip_eps) * b_adv
-                actor_loss = -torch.min(surr1, surr2).mean() - (entropy_coef * entropy)
+                surr1 = ratios * adv_t[idx]
+                surr2 = torch.clamp(ratios, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_t[idx]
+                actor_loss = -torch.min(surr1, surr2).mean() - ENTROPY_COEF * entropy
 
                 actor_opt.zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
                 actor_opt.step()
 
-                v_pred = critic(b_state).squeeze(-1)
-                critic_loss = nn.SmoothL1Loss()(v_pred, b_returns)
-
+                v_pred = critic(state_t[idx]).squeeze(-1)
+                critic_loss = nn.SmoothL1Loss()(v_pred, returns_t[idx])
                 critic_opt.zero_grad()
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
                 critic_opt.step()
 
-                epoch_actor_losses.append(actor_loss.item())
-                epoch_critic_losses.append(critic_loss.item())
+                actor_losses.append(actor_loss.item())
+                critic_losses.append(critic_loss.item())
 
-            # Evaluate KL divergence at epoch level
-            if np.mean(epoch_kls) > target_kl:
+            if np.mean(kls) > TARGET_KL:
                 break
 
-        total_ep_reward = sum(raw_ep_rewards.values())
+        mean_reward = float(np.mean(ep_rewards))
+        hist["update"].append(update + 1)
+        hist["reward"].append(mean_reward)
+        hist["ped"].append(float(np.mean(ep_ped)))
+        hist["area"].append(float(np.mean(ep_area)))
+        hist["ov"].append(float(np.mean(ep_ov)))
+        hist["actor_loss"].append(float(np.mean(actor_losses)))
+        hist["critic_loss"].append(float(np.mean(critic_losses)))
 
-        history_episodes.append(episode + 1)
-        history_rewards.append(total_ep_reward)
-        history_actor_loss.append(np.mean(epoch_actor_losses) if epoch_actor_losses else 0.0)
-        history_critic_loss.append(np.mean(epoch_critic_losses) if epoch_critic_losses else 0.0)
-
-        if total_ep_reward > best_reward:
-            best_reward = total_ep_reward
+        ma = float(np.mean(hist["reward"][-BEST_MA_WINDOW:]))
+        if len(hist["reward"]) >= BEST_MA_WINDOW and ma > best_ma:
+            best_ma = ma
             torch.save(actor.state_dict(), "checkpoints/best_actor.pth")
-            save_msg = " [Saved Best Model]"
-        else:
-            save_msg = ""
+        torch.save(actor.state_dict(), "checkpoints/last_actor.pth")
+        torch.save(critic.state_dict(), "checkpoints/last_critic.pth")
 
-        current_std = float(torch.exp(torch.clamp(actor.log_std, -2.0, 0.5))[0].item())
-        print(f"Episode {episode + 1:03d}/{num_episodes} | Swarm Reward: {total_ep_reward:6.1f} | Action Std: {current_std:.3f} | Actor Loss: {history_actor_loss[-1]:.4f} | Critic Loss: {history_critic_loss[-1]:.4f}{save_msg}")
-
-    checkpoint = {
-        "actor_state_dict": actor.state_dict(),
-        "critic_state_dict": critic.state_dict(),
-        "episode": num_episodes,
-        "best_reward": best_reward,
-    }
-    torch.save(checkpoint, "checkpoints/full_checkpoint.pth")
-    print("\n=== Training Finished. Checkpoints saved to ./checkpoints/ ===")
+        print(f"Update {update+1:03d}/{num_updates} | R {mean_reward:8.0f} | MA{BEST_MA_WINDOW} {ma:8.0f} | "
+              f"ped {hist['ped'][-1]*100:4.0f}% area {hist['area'][-1]*100:4.0f}% "
+              f"overlap {hist['ov'][-1]*100:4.0f}% | ret_std {ret_rms.std:6.1f} | "
+              f"std {torch.exp(actor.log_std).mean().item():.2f}")
 
     env.close()
-    plot_training_results(history_episodes, history_rewards, history_actor_loss, history_critic_loss)
+    plot_training_results(hist)
 
 
 if __name__ == "__main__":
